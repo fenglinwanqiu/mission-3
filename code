@@ -1,0 +1,282 @@
+import os, re, glob, random, math
+import numpy as np
+import pandas as pd
+import cv2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchvision
+from torchvision import transforms as T
+from sklearn.model_selection import train_test_split
+
+IMG_SIZE   = 512
+SIGMA      = 6.0
+BATCH      = 8
+EPOCHS     = 40
+LR         = 1e-4
+VAL_RATIO  = 0.2
+VIS_THRESH = 0.5
+PEAK_THRESH= 0.3
+SEED       = 42
+
+def set_seed(s):
+    random.seed(s); np.random.seed(s); torch.manual_seed(s)
+    torch.cuda.manual_seed_all(s)
+set_seed(SEED)
+torch.backends.cudnn.benchmark = True
+
+NORM = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+IMG_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
+
+DATA_DIR  = '/kaggle/input/competitions/2026task3/detection'
+TRAIN_DIR = os.path.join(DATA_DIR, 'train')
+TEST_DIR  = os.path.join(DATA_DIR, 'test')
+GT_PATH   = os.path.join(DATA_DIR, 'fovea_localization_train_GT.csv')
+SUB_PATH  = os.path.join(DATA_DIR, 'sample_submission.csv')
+
+print('DATA_DIR  =', DATA_DIR)
+print('train 文件数:', len(glob.glob(os.path.join(TRAIN_DIR, '*'))))
+print('test  文件数:', len(glob.glob(os.path.join(TEST_DIR, '*'))))
+print('train 样例:', sorted(glob.glob(os.path.join(TRAIN_DIR, '*')))[:5])
+
+# ===== 以下和之前一致 =====
+gt_raw = pd.read_csv(GT_PATH)
+print('=== GT 前5行 ==='); print(gt_raw.head())
+print('=== GT 列名 ===', list(gt_raw.columns))
+
+def canon(s):
+    m = re.search(r'\d+', str(s))
+    return str(int(m.group(0))) if m else str(s)
+
+def normalize_gt(df):
+    df = df.copy()
+    cols = list(df.columns)
+    if any('value' in str(c).lower() for c in cols):
+        id_col = cols[0]
+        val_col = [c for c in cols if 'value' in str(c).lower()][0]
+        df['base'] = df[id_col].astype(str).str.replace('_Fovea_X', '', regex=False) \
+                                 .str.replace('_Fovea_Y', '', regex=False)
+        df['axis'] = df[id_col].astype(str).str[-1]
+        df = df.pivot(index='base', columns='axis', values=val_col).reset_index()
+        df.columns.name = None
+        df.columns = ['image_id', 'X', 'Y']
+        cols = list(df.columns)
+
+    def pick(keywords, exclude=None):
+        for kw in keywords:
+            for c in cols:
+                if c == exclude:
+                    continue
+                cl = str(c).lower()
+                if kw in cl and 'index' not in cl and 'unnamed' not in cl:
+                    return c
+        return None
+
+    id_col = pick(['imageid', 'id', 'image', 'file', 'img', 'name'])
+    if id_col is None:
+        id_col = cols[0]
+    x_col = pick(['fovea_x', 'x_coord', 'coord_x', 'center_x', '_x', 'x'], exclude=id_col)
+    y_col = pick(['fovea_y', 'y_coord', 'coord_y', 'center_y', '_y', 'y'], exclude=id_col)
+    if x_col is None or y_col is None:
+        raise ValueError(f'无法自动识别 X/Y 列，GT 列名为: {cols}')
+
+    out = pd.DataFrame({
+        'image_id': df[id_col].astype(str).map(canon),
+        'x': pd.to_numeric(df[x_col], errors='coerce').astype(float),
+        'y': pd.to_numeric(df[y_col], errors='coerce').astype(float),
+    })
+    print(f'[GT解析] id列={id_col}, X列={x_col}, Y列={y_col}')
+    return out
+
+gt = normalize_gt(gt_raw)
+gt['visible'] = ((gt['x'] != 0) | (gt['y'] != 0)).astype(float)
+print('=== 标准化后 ==='); print(gt.head())
+print('样本数:', len(gt), '| 可见:', int(gt.visible.sum()), '| 不可见:', int((1 - gt.visible).sum()))
+
+def build_file_map(folder):
+    files = [f for f in glob.glob(os.path.join(folder, '*'))
+             if os.path.splitext(f)[1].lower() in IMG_EXTS]
+    return {canon(os.path.splitext(os.path.basename(f))[0]): f for f in files}
+
+train_map = build_file_map(TRAIN_DIR)
+test_map  = build_file_map(TEST_DIR)
+print('train_map 样例:', list(train_map.items())[:3])
+print('test_map  样例:', list(test_map.items())[:3])
+
+class FoveaDataset(Dataset):
+    def __init__(self, df, file_map, img_size=IMG_SIZE, train=False):
+        self.df = df.reset_index(drop=True)
+        self.file_map = file_map
+        self.img_size = img_size
+        self.train = train
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        path = self.file_map[canon(row['image_id'])]
+        img = cv2.imread(path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        oh, ow = img.shape[:2]
+        img = cv2.resize(img, (self.img_size, self.img_size))
+
+        x = float(row['x']); y = float(row['y']); visible = float(row['visible'])
+        cx = x * self.img_size / ow          # 512 尺度
+        cy = y * self.img_size / oh
+
+        if self.train:
+            if random.random() < 0.5:
+                img = img[:, ::-1].copy(); cx = self.img_size - 1 - cx   # 水平翻转
+            if random.random() < 0.5:
+                img = img[::-1, :].copy(); cy = self.img_size - 1 - cy   # 垂直翻转
+            a = random.uniform(0.9, 1.1); b = random.uniform(-12, 12)
+            img = np.clip(a * img.astype(np.float32) + b, 0, 255).astype(np.uint8)
+
+        img_t = torch.from_numpy(img.astype(np.float32) / 255.0).permute(2, 0, 1)
+        img_t = NORM(img_t)
+
+        # 归一化坐标目标（已和翻转保持一致）
+        coord = torch.tensor([cx / self.img_size, cy / self.img_size], dtype=torch.float32)
+        # 原始坐标 + 原图尺寸（评估/反算用）
+        meta = torch.tensor([x, y, ow, oh], dtype=torch.float32)
+        return img_t, coord, torch.tensor([visible], dtype=torch.float32), meta
+
+class FoveaRegressor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        try:
+            rn = torchvision.models.resnet34(weights=torchvision.models.ResNet34_Weights.IMAGENET1K_V1)
+        except Exception:
+            rn = torchvision.models.resnet34(weights='IMAGENET1K_V1')
+        self.encoder = nn.Sequential(*list(rn.children())[:-2])   # (B,512,H/32,W/32)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(512, 256), nn.ReLU(inplace=True), nn.Dropout(0.2),
+            nn.Linear(256, 3),     # x_norm, y_norm, vis_logit
+        )
+
+    def forward(self, x):
+        f = self.pool(self.encoder(x))
+        out = self.head(f)
+        x_norm = torch.sigmoid(out[:, 0])
+        y_norm = torch.sigmoid(out[:, 1])
+        vis = out[:, 2:3]
+        return x_norm, y_norm, vis
+
+def criterion(x_pred, y_pred, vis_logit, coord, vis_t):
+    mask = vis_t.view(-1)
+    loss_coord = (F.mse_loss(x_pred, coord[:, 0], reduction='none')
+                + F.mse_loss(y_pred, coord[:, 1], reduction='none'))
+    loss_coord = (loss_coord * mask).sum() / (mask.sum() + 1e-6)
+    loss_vis = F.binary_cross_entropy_with_logits(vis_logit, vis_t)
+    return loss_coord + 1.0 * loss_vis
+
+def val_metric(model, loader, device, vis_thresh=VIS_THRESH):
+    model.eval()
+    se, n = 0.0, 0
+    with torch.no_grad():
+        for img_t, coord, vis_t, meta in loader:
+            img_t = img_t.to(device)
+            x_pred, y_pred, vis_logit = model(img_t)
+            x_n = x_pred.cpu().numpy(); y_n = y_pred.cpu().numpy()
+            vis_prob = torch.sigmoid(vis_logit).cpu().numpy().ravel()
+            x_gt = meta[:, 0].numpy(); y_gt = meta[:, 1].numpy()
+            ow = meta[:, 2].numpy(); oh = meta[:, 3].numpy()
+            for i in range(img_t.shape[0]):
+                if vis_prob[i] < vis_thresh:
+                    px, py = 0.0, 0.0
+                else:
+                    px = x_n[i] * ow[i]
+                    py = y_n[i] * oh[i]
+                se += (px - x_gt[i]) ** 2 + (py - y_gt[i]) ** 2
+                n += 1
+    return math.sqrt(se / (2 * n))
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('device =', device)
+
+vis = gt[gt.visible == 1]; inv = gt[gt.visible == 0]
+train_parts, val_parts = [], []
+for sub in [vis, inv]:
+    if len(sub) == 0:
+        continue
+    a, b = train_test_split(sub, test_size=VAL_RATIO, random_state=SEED)
+    train_parts.append(a); val_parts.append(b)
+train_df = pd.concat(train_parts).sample(frac=1, random_state=SEED).reset_index(drop=True)
+val_df = pd.concat(val_parts).reset_index(drop=True)
+print('训练集:', len(train_df), '| 验证集:', len(val_df))
+
+train_ds = FoveaDataset(train_df, train_map, train=True)
+val_ds = FoveaDataset(val_df, train_map, train=False)
+train_loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True, num_workers=2)
+val_loader = DataLoader(val_ds, batch_size=BATCH, shuffle=False, num_workers=2)
+
+model = FoveaRegressor().to(device)
+opt = torch.optim.AdamW(model.parameters(), lr=LR)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
+best_rmse = float('inf')
+
+for epoch in range(1, EPOCHS + 1):
+    model.train()
+    total_loss = 0.0; cnt = 0
+    for img_t, coord, vis_t, meta in train_loader:
+        img_t = img_t.to(device)
+        coord = coord.to(device)
+        vis_t = vis_t.to(device)
+        x_pred, y_pred, vis_logit = model(img_t)
+        loss = criterion(x_pred, y_pred, vis_logit, coord, vis_t)
+        opt.zero_grad(); loss.backward(); opt.step()
+        total_loss += loss.item(); cnt += 1
+    sched.step()
+    val_rmse = val_metric(model, val_loader, device)
+    tag = ' *' if val_rmse < best_rmse else ''
+    if val_rmse < best_rmse:
+        best_rmse = val_rmse
+        torch.save(model.state_dict(), 'best_model.pt')
+    print(f'Epoch {epoch:02d} | loss {total_loss/cnt:.4f} | val RMSE {val_rmse:.2f}{tag}')
+
+print('最佳验证 RMSE:', best_rmse)
+
+model.load_state_dict(torch.load('best_model.pt'))
+model.eval()
+
+def predict_image(path):
+    img = cv2.imread(path)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    oh, ow = img.shape[:2]
+    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
+    img_t = NORM(torch.from_numpy(img).permute(2, 0, 1)).unsqueeze(0).to(device)
+    with torch.no_grad():
+        x_pred, y_pred, vis_logit = model(img_t)
+    return x_pred.item(), y_pred.item(), torch.sigmoid(vis_logit).item(), ow, oh
+
+sub = pd.read_csv(SUB_PATH)
+print('submission 行数:', len(sub), '| 列名:', list(sub.columns))
+
+preds = {}
+bases = sorted({str(r['ImageID']).split('_Fovea_')[0] for _, r in sub.iterrows()})
+for base in bases:
+    path = test_map[canon(base)]
+    xn, yn, vis, ow, oh = predict_image(path)
+    if vis < VIS_THRESH:
+        x, y = 0.0, 0.0
+    else:
+        x = xn * ow
+        y = yn * oh
+    preds[canon(base)] = (round(x, 3), round(y, 3))
+    print(f'  {base}: ({x:.1f}, {y:.1f})  vis={vis:.2f}')
+
+vals = []
+for _, r in sub.iterrows():
+    sid = str(r['ImageID'])
+    base, axis = sid.split('_Fovea_')
+    x, y = preds[canon(base)]
+    vals.append(x if axis == 'X' else y)
+
+sub['value'] = vals
+sub.to_csv('submission.csv', index=False)
+print('=== 提交文件前 10 行 ==='); print(sub.head(10))
+print('已保存 submission.csv，共', len(sub), '行')
